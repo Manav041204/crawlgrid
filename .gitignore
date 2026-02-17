@@ -1,2 +1,21 @@
-.idea
-*.json
+# Python bytecode (compiled files)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Your Project Specifics
+# Ignore the JSON tracking file so your local tests don't overwrite others'
+browser_registry.json
+
+# IDE Settings
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db

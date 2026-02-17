@@ -1,3 +1,9 @@
+from typing import Optional
+import os
+import json
+from DrissionPage import ChromiumPage, ChromiumOptions
+import psutil
+
 class BrowserManager:
     def __init__(self):
         self._ensure_registry_exists()
