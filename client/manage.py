@@ -55,6 +55,35 @@ class BrowserManager:
             }
         except Exception as e:
             return {"status": "error", "message": f"Launch failed: {str(e)}"}
+    
+    def get_browser(self, port: int) -> ChromiumPage:
+        """
+        Retrieves a browser instance. If the process is crashed, 
+        it heals itself by restarting the browser.
+        """
+        registry = self._load_registry()
+        port_str = str(port)
+
+        if port_str in registry:
+            pid = registry[port_str].get("process_id")
+            
+            # Check if process is actually running
+            if not self._is_process_running(pid):
+                self.launch(port=port) # Re-launch on the same port
+        
+        # Now that we've ensured it's alive (or restarted), return the page object
+        co = ChromiumOptions().set_local_port(port)
+        return ChromiumPage(co)
+
+
+    def _is_process_running(self, pid: int) -> bool:
+        """Checks if a PID exists and is a python/chrome process."""
+        try:
+            proc = psutil.Process(pid)
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+            return False
+
 
     def kill(self, port: int) -> dict:
         registry = self._load_registry()
@@ -106,8 +135,7 @@ class BrowserManager:
                     if remaining_tabs <= 0:
                         break
                     
-                    co = ChromiumOptions().set_local_port(int(port_str))
-                    page = ChromiumPage(co)
+                    page = self.get_browser(int(port_str))
                     
                     current_tab_count = len(page.tab_ids)
                     
