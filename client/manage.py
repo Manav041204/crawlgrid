@@ -4,12 +4,14 @@ import json
 from DrissionPage import ChromiumPage, ChromiumOptions
 import psutil
 
+REGISTRY_FILE = "browser_registry.json"
+
 class BrowserManager:
     def __init__(self):
         self._ensure_registry_exists()
 
     def _ensure_registry_exists(self):
-        if not os.path.exists(REGISTRY_FILE):
+        if not os.path.exists("REGISTRY_FILE"):
             self._save_registry({})
 
     def _load_registry(self) -> dict:
@@ -53,6 +55,35 @@ class BrowserManager:
             }
         except Exception as e:
             return {"status": "error", "message": f"Launch failed: {str(e)}"}
+    
+    def get_browser(self, port: int) -> ChromiumPage:
+        """
+        Retrieves a browser instance. If the process is crashed, 
+        it heals itself by restarting the browser.
+        """
+        registry = self._load_registry()
+        port_str = str(port)
+
+        if port_str in registry:
+            pid = registry[port_str].get("process_id")
+            
+            # Check if process is actually running
+            if not self._is_process_running(pid):
+                self.launch(port=port) # Re-launch on the same port
+        
+        # Now that we've ensured it's alive (or restarted), return the page object
+        co = ChromiumOptions().set_local_port(port)
+        return ChromiumPage(co)
+
+
+    def _is_process_running(self, pid: int) -> bool:
+        """Checks if a PID exists and is a python/chrome process."""
+        try:
+            proc = psutil.Process(pid)
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+            return False
+
 
     def kill(self, port: int) -> dict:
         registry = self._load_registry()
@@ -104,8 +135,7 @@ class BrowserManager:
                     if remaining_tabs <= 0:
                         break
                     
-                    co = ChromiumOptions().set_local_port(int(port_str))
-                    page = ChromiumPage(co)
+                    page = self.get_browser(int(port_str))
                     
                     current_tab_count = len(page.tab_ids)
                     
@@ -138,7 +168,38 @@ class BrowserManager:
         except Exception as e:
             return {"status": "error", "message": f"Tab Launch failed: {str(e)}"}
 
-    def get_active_ports(self) -> List[int]:
+    def get_active_ports(self):
         registry = self._load_registry()
         # Returns a list of keys (ports) as integers
         return [int(p) for p in registry.keys()]
+    
+    def cleanup_all_resources(self):
+        """Kills all processes listed in the registry."""
+        registry = self._load_registry()
+        ports = list(registry.keys())
+        
+        if not ports:
+            print("Registry empty. No resources to clean up.")
+            return
+
+        print(f"Found {len(ports)} active browser instances. Cleaning up...")
+        
+        for port in ports:
+            try:
+                pid = registry[port]["process_id"]
+                
+                # Kill process tree
+                parent = psutil.Process(pid)
+                for child in parent.children(recursive=True):
+                    child.kill()
+                parent.kill()
+                
+                print(f"Killed process {pid} (Port {port})")
+                
+            except psutil.NoSuchProcess:
+                print(f"Process {pid} (Port {port}) already dead.")
+            except Exception as e:
+                print(f"Error killing process {pid}: {e}")
+        
+        # Clear registry
+        self._save_registry({})

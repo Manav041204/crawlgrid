@@ -11,10 +11,14 @@ from typing import Optional, List
 # Python file imports
 from manage import BrowserManager
 
-REGISTRY_FILE = "browser_registry.json"
 
 manager = BrowserManager()
 app = FastAPI()
+
+# @app.on_event("startup")
+# async def startup_event():
+#     """This runs once when you start the uvicorn server"""
+#     manager.cleanup_all_resources()
 
 @app.get('/launch/{port}')
 async def launch_with_port(port: int):
