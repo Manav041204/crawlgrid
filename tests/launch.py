@@ -65,5 +65,5 @@ class CrawlGrid:
 if __name__ == "__main__":
     crawl_grid = CrawlGrid(["http://localhost:8000"])
 
-    # asyncio.run(crawl_grid.close_grid())
-    asyncio.run(crawl_grid.launch_grid(instances=3))
+    asyncio.run(crawl_grid.close_grid())
+    # asyncio.run(crawl_grid.launch_grid(instances=50))
