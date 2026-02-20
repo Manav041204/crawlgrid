@@ -10,7 +10,7 @@ from typing import Optional, List
 
 # Python file imports
 from manage import BrowserManager
-from utils import get_active_ports, load_registry
+from utils import get_active_ports, load_registry, cleanup_all_resources
 
 
 manager = BrowserManager()
@@ -19,7 +19,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event():
     """This runs once when you start the uvicorn server"""
-    manager.cleanup_all_resources()
+    cleanup_all_resources()
 
 # FOR BROWSER EVENTS
 
@@ -35,7 +35,7 @@ async def launch_with_port(port: int):
 
 @app.get('/launch-tabs/{tabs}')
 async def launch_tabs(tabs: int):
-    result = manager.launch_tabs(total_tabs_to_add=tabs)
+    result = await manager.launch_tabs(total_tabs_to_add=tabs)
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result)
     return result
@@ -49,7 +49,7 @@ async def kill_with_port(port: int):
 
 @app.post('/get-url')
 async def get_url(url: str):
-    result = manager.get_url(url)
+    result = await manager.get_url(url)
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result)
     return result

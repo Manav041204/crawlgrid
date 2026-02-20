@@ -1,15 +1,19 @@
 import os
+import asyncio
 from typing import Optional, List
 from DrissionPage import ChromiumPage, ChromiumOptions
-from utils import load_registry, save_registry, is_process_running, kill_process_tree
+from utils import load_registry, save_registry, is_process_running, kill_process_tree, update_registry
 
 class BrowserManager:
     def __init__(self):
         self.MAX_BROWSERS = 10  # Hard limit
         self.MAX_TABS_PER_BROWSER = 10
+        self.tab_pool = asyncio.Queue()
         # Ensure registry exists on init
         if not os.path.exists("browser_registry.json"):
             save_registry({})
+    
+
 
     def launch(self, port: Optional[int] = None) -> dict:
         registry = load_registry()
@@ -73,7 +77,7 @@ class BrowserManager:
         
         return {"status": "success", "message": f"Port {port} terminated." if success else "Process already dead."}
 
-    def launch_tabs(self, total_tabs_to_add: int) -> dict:
+    async def launch_tabs(self, total_tabs_to_add: int) -> dict:
         # Distribution logic remains here as it's a core 'Management' feature
         try:
             registry = load_registry()
@@ -94,6 +98,9 @@ class BrowserManager:
                     
                     if len(current_tabs) < self.MAX_TABS_PER_BROWSER:
                         new_tab = page.new_tab()
+
+                        await self.tab_pool.put({"port": port_str, "obj": new_tab})
+
                         current_tabs[new_tab.tab_id] = {"status": "idle", "url": "about:blank"}
                         registry[port_str]["tabs"] = current_tabs
                         remaining -= 1
@@ -103,13 +110,48 @@ class BrowserManager:
                 if not added_any: break
 
             save_registry(registry)
-            return {"status": "success", "distribution": report, "remaining": remaining}
+            return {"status": "success", "message": "Distribution Success", "distribution": report, "remaining": remaining}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+    
+    async def get_url(self, url: str) -> dict:
+        """Uses the in-memory tab pool for near-instant URL processing."""
+        try:
+            # 1. Acquire: Wait for an idle tab from the memory queue
+            # If the queue is empty, this will pause here without blocking the server
+            tab_data = await self.tab_pool.get()
+            tab_obj = tab_data["obj"]
+            port = tab_data["port"]
+            tab_id = tab_obj.tab_id
 
-    def cleanup_all_resources(self):
-        """Kills all processes listed in the registry."""
-        registry = load_registry()
-        for port, data in registry.items():
-            kill_process_tree(data["process_id"])
-        save_registry({})
+            # 2. Work: Navigate in a separate thread
+            # This prevents tab.get() from freezing your entire FastAPI application
+            def perform_navigation():
+                # You can set a timeout here to prevent one slow site from hanging the tab
+                tab_obj.get(url, timeout=20)
+
+            print(f"🚀 [Grid] Assigning {url} to Port {port} | Tab {tab_id}")
+            await asyncio.to_thread(perform_navigation)
+
+            # 3. Update Status (Background/Optional)
+            update_registry(port, tab_id, "busy", url)
+            
+            return {
+                "status": "success",
+                "port": port,
+                "tab_id": tab_id,
+                "url": url,
+                "message": f"Navigation complete on Port {port}"
+            }
+
+        except Exception as e:
+            print(f"❌ [Grid] Error processing {url}: {e}")
+            return {"status": "error", "message": str(e)}
+
+        finally:
+            # 4. Release: Crucial! Put the tab back into the pool so others can use it
+            await self.tab_pool.put(tab_data)
+            update_registry(port, tab_id, "idle", "about:blank")
+
+            # Signal that the processing for this specific item is done
+            self.tab_pool.task_done()
