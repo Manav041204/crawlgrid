@@ -24,11 +24,9 @@ def update_registry(port: str, tab_id: str, status: str, url: str):
     """Helper to sync in-memory state to the JSON registry."""
     try:
         registry = load_registry()
-        print("$$$$", type(port), tab_id)
         if port in registry and tab_id in registry[port]["tabs"]:
             registry[port]["tabs"][tab_id]["status"] = status
             registry[port]["tabs"][tab_id]["url"] = url
-            print(f"✅ Registry Sync: {port} | {tab_id} -> {url}")
             save_registry(registry)
         
     except Exception as e:

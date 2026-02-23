@@ -23,7 +23,7 @@ async def startup_event():
 
 # FOR BROWSER EVENTS
 
-@app.get('/launch/{port}')
+@app.get('/launch')
 async def launch_with_port(port: int):
     result = manager.launch(port=port)
     if result["status"] == "error":
@@ -33,14 +33,20 @@ async def launch_with_port(port: int):
         raise HTTPException(status_code=500, detail=result["message"])
     return result
 
-@app.get('/launch-tabs/{tabs}')
-async def launch_tabs(tabs: int):
-    result = await manager.launch_tabs(total_tabs_to_add=tabs)
+@app.get('/launch-tabs')
+async def launch_tabs(
+    total_tabs: Optional[int] = None,
+    tab_per_browser: Optional[int] = None
+):
+    if total_tabs:
+        result = await manager.launch_tabs(total_tabs_to_add=total_tabs)
+    else:
+        result = await manager.launch_tabs(tab_per_browser=tab_per_browser)
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result)
     return result
 
-@app.get('/kill/{port}')
+@app.get('/kill')
 async def kill_with_port(port: int):
     result = manager.kill(port)
     if result["status"] == "error":
@@ -50,6 +56,13 @@ async def kill_with_port(port: int):
 @app.post('/get-url')
 async def get_url(url: str):
     result = await manager.get_url(url)
+    if result["status"] == "error":
+        raise HTTPException(status_code=404, detail=result)
+    return result
+
+@app.post('/get-element')
+async def get_element(tab_id: str, xpath: str, timeout: int = 10):
+    result = await manager.get_element(tab_id, xpath, timeout)
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result)
     return result

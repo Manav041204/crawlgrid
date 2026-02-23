@@ -21,7 +21,7 @@ class CrawlGrid:
 
     async def _launch_instance(self, client, remote_url, port):
         try:
-            response = await client.get(f"{remote_url}/launch/{port}")
+            response = await client.get(f"{remote_url}/launch", params={"port": port})
             if response.status_code == 200:
                 self.ports.append(port)
                 print(f"Browser launched on {remote_url} port {port}")
@@ -55,7 +55,7 @@ class CrawlGrid:
 
     async def _close_instance(self, client, remote_url, port):
         try:
-            response = await client.get(f"{remote_url}/kill/{port}")
+            response = await client.get(f"{remote_url}/kill", params={"port": port})
             if response.status_code == 200:
                 print(f"Browser closed on {remote_url} port {port}")
         except Exception as e:
@@ -68,7 +68,8 @@ class CrawlGrid:
             try:
                 print(f"--- Requesting {count} additional tabs ---")
                 response = await client.get(
-                    f"{remote_url}/launch-tabs/{count}", 
+                    f"{remote_url}/launch-tabs", 
+                    params={"total_tabs": count},
                     timeout=60.0 # Opening many tabs can take time
                 )
                 if response.status_code == 200:
@@ -93,7 +94,7 @@ class CrawlGrid:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    print(f"✅ Success: Port {data['port']} | Tab {data['tab_id']} -> {url}")
+                    print(f"✅ Success: Port {data['port']} | Tab {data['tab_id']} -> {url} | HTML: {data['html'][:100]} | Headers: {data['headers']} | Cookies: {data['cookies']}")
                     return data
                 else:
                     # Actually print what the server said (e.g., "Capacity reached")
@@ -131,8 +132,7 @@ class CrawlGrid:
             "https://amazon.com","https://google.com", "https://bing.com", "https://github.com",
             "https://python.org", "https://fastapi.tiangolo.com", "https://reddit.com",
             "https://stackoverflow.com", "https://wikipedia.org", "https://apple.com",
-            "https://amazon.com",
-            
+            "https://amazon.com",       
         ]
 
         tasks = [self.get_url(url) for url in urls]
@@ -154,10 +154,10 @@ if __name__ == "__main__":
     
     time.sleep(5)
     # 2. Start 2 browsers (Default 1 tab each = 2 tabs total)
-    asyncio.run(crawl_grid.launch_grid(instances=4))
+    asyncio.run(crawl_grid.launch_grid(instances=3))
 
     # 3. Add 4 more tabs (Total 6 tabs)
-    asyncio.run(crawl_grid.distribute_tabs(count=40))
+    asyncio.run(crawl_grid.distribute_tabs(count=30))
     
     # 4. Run 10 URL requests (Should see 6 successes and 4 failures)
     asyncio.run(crawl_grid.test_get_url())
