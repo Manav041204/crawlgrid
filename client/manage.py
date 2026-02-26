@@ -13,9 +13,8 @@ class BrowserManager:
         # Ensure registry exists on init
         if not os.path.exists("browser_registry.json"):
             save_registry({})
+        self.active_elements = {}
     
-
-
     def launch(self, port: Optional[int] = None) -> dict:
         registry = load_registry()
         
@@ -122,9 +121,14 @@ class BrowserManager:
                     if can_add:
                         # Physical creation
                         new_tab = page.new_tab()
-
+                        tab_id = new_tab.tab_id
                         # Put into the LIVE memory pool
-                        await self.tab_pool.put({"port": port_str, "obj": new_tab, "tab_id": new_tab.tab_id})
+                        tab_data = {
+                            "port": port_str, 
+                            "obj": new_tab, 
+                            "tab_id": tab_id
+                        }
+                        await self.tab_pool.put(tab_data)
                         self.tab_index[tab_id] = tab_data
 
                         # Update Registry data
@@ -240,7 +244,7 @@ class BrowserManager:
             port = tab_data["port"]
 
             def perform_operation():
-                element = tab_obj.ele(f"xpath://{xpath}", timeout=timeout)
+                element = tab_obj.ele(f"xpath:{xpath}", timeout=timeout)
                 if element:
                     return element
                 else:
@@ -251,12 +255,49 @@ class BrowserManager:
             if not element:
                 return {"status": "error", "message": "Element not found"}
 
+            self.active_elements[tab_id]= element
+
             return {
                 "status": "success",
                 "port": port,
                 "tab_id": tab_id,
-                "element": element,
-                "message": f"Element found on Port {port}"
+                "element": element.html,
+                "message": f"Element found on tab_id {tab_id} Port {port}"
+            }
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def click_element(self, tab_id: str, timeout: int = 10):
+        try:
+            tab_data = self.tab_index.get(tab_id)
+            if not tab_data:
+                return {"status": "error", "message": f"Tab {tab_id} not found in pool."}
+            
+            tab_obj = tab_data["obj"]
+            port = tab_data["port"]
+
+            def perform_operation():
+                element = self.active_elements.get(tab_id)
+                print(element)
+                if element:
+                    return element.click(timeout=timeout)
+                else:
+                    return None
+
+            is_clicked = await asyncio.to_thread(perform_operation)
+            print(is_clicked)
+
+            if is_clicked is None:
+                return {"status": "error", "message": "Element not found"}
+            if not is_clicked:
+                return {"status": "error", "message": "Element not clicked"}
+
+            return {
+                "status": "success",
+                "port": port,
+                "tab_id": tab_id,
+                "message": f"Element clicked found on tab_id {tab_id} Port {port}"
             }
 
         except Exception as e:

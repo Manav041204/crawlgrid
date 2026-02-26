@@ -67,7 +67,12 @@ async def get_element(tab_id: str, xpath: str, timeout: int = 10):
         raise HTTPException(status_code=404, detail=result)
     return result
 
-# FOR BROWSER MANAGMENT
+@app.post('/click')
+async def click_element(tab_id: str, timeout: int = 10):
+    result = await manager.click_element(tab_id, timeout)
+    if result["status"] == "error":
+        raise HTTPException(status_code=404, detail=result)
+    return result
 
 @app.get('/list-browsers')
 async def list_browsers():
