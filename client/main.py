@@ -54,22 +54,22 @@ async def kill_with_port(port: int):
     return result
 
 @app.post('/get-url')
-async def get_url(url: str):
-    result = await manager.get_url(url)
+async def get_url(url: str, release_tab: bool = True):
+    result = await manager.get_url(url, release_tab)
+    if result["status"] == "error":
+        raise HTTPException(status_code=404, detail=result)
+    return result
+
+@app.post('/release-tab')
+async def release_tab(tab_id: str):
+    result = await manager.release_tab_by_id(tab_id)
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result)
     return result
 
 @app.post('/get-element')
-async def get_element(tab_id: str, xpath: str, timeout: int = 10):
-    result = await manager.get_element(tab_id, xpath, timeout)
-    if result["status"] == "error":
-        raise HTTPException(status_code=404, detail=result)
-    return result
-
-@app.post('/click')
-async def click_element(tab_id: str, timeout: int = 10):
-    result = await manager.click_element(tab_id, timeout)
+async def get_element(tab_id: str, xpath: str, click: bool = False, input_text: str = None, timeout: int = 10):
+    result = await manager.get_element(tab_id, xpath, click, input_text, timeout)
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result)
     return result

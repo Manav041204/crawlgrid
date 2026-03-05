@@ -61,15 +61,15 @@ class CrawlGrid:
         except Exception as e:
             print(f"Failed to close browser on {remote_url} port {port}: {e}")
 
-    async def distribute_tabs(self, count: int):
+    async def distribute_tabs(self, total_tabs: int = 0, tab_per_browser: int = 0):
         """Hits the /distribute-tabs endpoint to scale tab count across browsers."""
         remote_url = self.remote_urls[0]
         async with httpx.AsyncClient() as client:
             try:
-                print(f"--- Requesting {count} additional tabs ---")
+                print(f"--- Requesting {total_tabs if total_tabs else tab_per_browser} additional tabs ---")
                 response = await client.get(
                     f"{remote_url}/launch-tabs", 
-                    params={"total_tabs": count},
+                    params={"total_tabs": total_tabs} if total_tabs > 0 else {"tab_per_browser": tab_per_browser},
                     timeout=60.0 # Opening many tabs can take time
                 )
                 if response.status_code == 200:
@@ -89,18 +89,22 @@ class CrawlGrid:
             try:
                 response = await client.post(
                     f"{remote_url}/get-url", 
-                    params={"url": url}
+                    params={"url": url, "release_tab": False},
+                    headers={
+                        # 'content-length': '0',
+                        # 'content-type': 'application/json'
+                    }
                 )
                 if response.status_code == 200:
                     data = response.json()
                     tab_id = data['tab_id']
-                    print(f"✅ Success: Port {data['port']} | Tab {data['tab_id']} -> {url}")
-                    response = await client.post(
-                        f"{remote_url}/get-element", 
-                        params={"tab_id": tab_id, "xpath": "//div[@class='image_container']"}
-                    )
-                    element = response.json().get('element')
-                    print(f"✅ Success: Port {data['port']} | Tab {data['tab_id']} | element: {element} -> {url}")
+                    port = data['port']
+                    await self.get_element(tab_id, port, url)
+                    print(f"✅ Success: Port {port} | Tab {tab_id} -> {url}")
+                    
+                    # Release tab
+                    await client.post(f"{remote_url}/release-tab", params={"tab_id": tab_id})
+                    
                     return data
                 else:
                     error_detail = response.json().get('detail', response.text)
@@ -109,10 +113,27 @@ class CrawlGrid:
             except Exception as e:
                 print(f"⚠️ Network/Request Error for {url}: {type(e).__name__} - {e}")
                 return None
+    
+    async def get_element(self, tab_id, port, url):
+        remote_url = self.remote_urls[0]
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{remote_url}/get-element", 
+                    params={"tab_id": tab_id, "input_text": "Tshirt", "xpath": '//input[@id="twotabsearchtextbox"]'}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    element_html = data.get('element_html', '')
+                    html_snippet = element_html[:50] + "..." if element_html else "None"
+                    print(f"✅ Success: Port {port} | Tab {tab_id} | element_html: {html_snippet} -> {url}")
+                else:
+                    print(f"⚠️ Failed to get element on Tab {tab_id}: {response.text}")
+            except Exception as e:
+                print(f"⚠️ get_element Error for {url}: {e}")
 
     async def test_get_url(self):
         urls = [
-            "https://books.toscrape.com/catalogue/category/books_1/index.html",
             "https://books.toscrape.com/catalogue/category/books/travel_2/index.html",
             "https://books.toscrape.com/catalogue/category/books/mystery_3/index.html",
             "https://books.toscrape.com/catalogue/category/books/historical-fiction_4/index.html",
@@ -164,8 +185,8 @@ class CrawlGrid:
             "https://books.toscrape.com/catalogue/category/books/erotica_50/index.html",
             "https://books.toscrape.com/catalogue/category/books/crime_51/index.html",       
         ]
-
-        tasks = [self.get_url(url) for url in urls[0:]]
+        urls = ["https://www.amazon.in/" for _ in range(30)]
+        tasks = [self.get_url(url) for url in urls]
         results = await asyncio.gather(*tasks)
 
         successes = [r for r in results if r and r.get("status") == "success"]
@@ -173,6 +194,7 @@ class CrawlGrid:
         print(f"Total Requests: {len(urls)}")
         print(f"Successful Navigations: {len(successes)}")
         print(f"Capacity Blocked: {len(urls) - len(successes)}")
+        
 
 if __name__ == "__main__":
 
@@ -184,10 +206,10 @@ if __name__ == "__main__":
     
     time.sleep(5)
     # 2. Start 2 browsers (Default 1 tab each = 2 tabs total)
-    asyncio.run(crawl_grid.launch_grid(instances=1))
+    asyncio.run(crawl_grid.launch_grid(instances=2))
 
     # 3. Add 4 more tabs (Total 6 tabs)
-    asyncio.run(crawl_grid.distribute_tabs(count=1))
+    asyncio.run(crawl_grid.distribute_tabs(tab_per_browser=2))
     
     # 4. Run 10 URL requests (Should see 6 successes and 4 failures)
     asyncio.run(crawl_grid.test_get_url())

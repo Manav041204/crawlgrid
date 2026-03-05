@@ -3,11 +3,14 @@ import time
 import threading
 
 co = ChromiumOptions()
+co.set_argument("--start-maximized")
 page = ChromiumPage(co)
 
 tab = page.latest_tab
 
-tab.get('https://github.com/Manav041204/crawlgrid')
-an_ele = tab.ele('xpath:(//ol[@class="prc-Breadcrumbs-BreadcrumbsList-BKjpe"]//li/a)[1]')
-an_ele.click()
-print(an_ele.html)
+tab.get('https://www.amazon.in/')
+time.sleep(5)
+ele = tab.ele('xpath://input[@id="twotabsearchtextbox"]', timeout=10)
+print(ele.html)
+ele.input("Tshirt")
+time.sleep(5)

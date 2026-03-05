@@ -80,7 +80,7 @@ class BrowserManager:
             kill_process_tree(pid)
             del registry[port_str]
             save_registry(registry)
-            return {"status": "success", "message": f"Port {port} terminated." if success else "Process already dead."}
+            return {"status": "success", "message": f"Port {port} terminated."}
 
     async def launch_tabs(self, total_tabs_to_add: int = 0, tab_per_browser: int = 0) -> dict:
         """
@@ -167,15 +167,26 @@ class BrowserManager:
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
-    async def get_url(self, url: str) -> dict:
+    async def get_url(self, url: str, release_tab: bool = True) -> dict:
         """Uses the in-memory tab pool for near-instant URL processing."""
+        tab_data = None
         try:
-            # 1. Acquire: Wait for an idle tab from the memory queue
-            # If the queue is empty, this will pause here without blocking the server
-            tab_data = await self.tab_pool.get()
+            while True:
+                # 1. Acquire: Wait for an idle tab from the memory queue
+                # If the queue is empty, this will pause here without blocking the server
+                tab_data = await self.tab_pool.get()
+                
+                # Check if tab was invalidated by a kill operation
+                if tab_data["tab_id"] not in self.tab_index:
+                    self.tab_pool.task_done()
+                    tab_data = None
+                    continue
+                
+                break
+
             tab_obj = tab_data["obj"]
             port = tab_data["port"]
-            tab_id = tab_obj.tab_id
+            tab_id = tab_data["tab_id"]
 
             # 2. Work: Navigate in a separate thread
             # This prevents tab.get() from freezing your entire FastAPI application
@@ -226,14 +237,30 @@ class BrowserManager:
             return {"status": "error", "message": str(e)}
 
         finally:
-            # 4. Release: Crucial! Put the tab back into the pool so others can use it
+            if tab_data is not None:
+                if release_tab:
+                    if tab_data["tab_id"] in self.tab_index:
+                        # 4. Release: Crucial! Put the tab back into the pool so others can use it
+                        await self.tab_pool.put(tab_data)
+                        update_registry(tab_data["port"], tab_data["tab_id"], "idle", "about:blank")
+
+                # Signal that the processing for this specific item is done
+                self.tab_pool.task_done()
+
+    async def release_tab_by_id(self, tab_id: str) -> dict:
+        try:
+            if tab_id not in self.tab_index:
+                return {"status": "error", "message": f"Tab {tab_id} not found."}
+            
+            tab_data = self.tab_index[tab_id]
             await self.tab_pool.put(tab_data)
-            update_registry(port, tab_id, "idle", "about:blank")
+            update_registry(tab_data["port"], tab_id, "idle", "about:blank")
+            
+            return {"status": "success", "message": f"Tab {tab_id} released."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
-            # Signal that the processing for this specific item is done
-            self.tab_pool.task_done()
-
-    async def get_element(self, tab_id: str, xpath: str, timeout: int = 10):
+    async def get_element(self, tab_id: str, xpath: str, click: bool = False, input_text: str = None, timeout: int = 10):
         try:
             tab_data = self.tab_index.get(tab_id)
             
@@ -243,61 +270,48 @@ class BrowserManager:
             tab_obj = tab_data["obj"]
             port = tab_data["port"]
 
-            def perform_operation():
+            def perform_operation_element():
                 element = tab_obj.ele(f"xpath:{xpath}", timeout=timeout)
                 if element:
                     return element
                 else:
                     return None
 
-            element = await asyncio.to_thread(perform_operation)
-            
+            def perform_operation_click(element):
+                if element:
+                    return element.click(timeout=timeout)
+                else:
+                    return None 
+
+            def perform_operation_input(element):
+                if element:
+                    return element.input(input_text)
+                    # return True
+                else:
+                    return None 
+
+            element = await asyncio.to_thread(perform_operation_element)
             if not element:
                 return {"status": "error", "message": "Element not found"}
 
             self.active_elements[tab_id]= element
 
-            return {
-                "status": "success",
-                "port": port,
-                "tab_id": tab_id,
-                "element": element.html,
-                "message": f"Element found on tab_id {tab_id} Port {port}"
-            }
+            if click:
+                is_clicked = await asyncio.to_thread(perform_operation_click, element)
+                if not is_clicked:
+                    return {"status": "error", "message": "Element not clicked"}
 
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    async def click_element(self, tab_id: str, timeout: int = 10):
-        try:
-            tab_data = self.tab_index.get(tab_id)
-            if not tab_data:
-                return {"status": "error", "message": f"Tab {tab_id} not found in pool."}
-            
-            tab_obj = tab_data["obj"]
-            port = tab_data["port"]
-
-            def perform_operation():
-                element = self.active_elements.get(tab_id)
-                print(element)
-                if element:
-                    return element.click(timeout=timeout)
-                else:
-                    return None
-
-            is_clicked = await asyncio.to_thread(perform_operation)
-            print(is_clicked)
-
-            if is_clicked is None:
-                return {"status": "error", "message": "Element not found"}
-            if not is_clicked:
-                return {"status": "error", "message": "Element not clicked"}
+            if input_text:
+                is_input = await asyncio.to_thread(perform_operation_input, element)
+                if not is_input:
+                    return {"status": "error", "message": "Element not input"}
 
             return {
                 "status": "success",
                 "port": port,
                 "tab_id": tab_id,
-                "message": f"Element clicked found on tab_id {tab_id} Port {port}"
+                "element_html": element.html,
+                "message": f"Element found and clicked on tab_id {tab_id} Port {port}" if click else f"Element found on tab_id {tab_id} Port {port}"
             }
 
         except Exception as e:
