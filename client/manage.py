@@ -2,6 +2,10 @@ import os
 import asyncio
 from typing import Optional, List
 from DrissionPage import ChromiumPage, ChromiumOptions
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+import json
+# Python file imports
 from utils import load_registry, save_registry, is_process_running, kill_process_tree, update_registry
 
 class BrowserManager:
@@ -247,19 +251,6 @@ class BrowserManager:
                 # Signal that the processing for this specific item is done
                 self.tab_pool.task_done()
 
-    async def release_tab_by_id(self, tab_id: str) -> dict:
-        try:
-            if tab_id not in self.tab_index:
-                return {"status": "error", "message": f"Tab {tab_id} not found."}
-            
-            tab_data = self.tab_index[tab_id]
-            await self.tab_pool.put(tab_data)
-            update_registry(tab_data["port"], tab_id, "idle", "about:blank")
-            
-            return {"status": "success", "message": f"Tab {tab_id} released."}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
     async def get_element(self, tab_id: str, xpath: str, click: bool = False, input_text: str = None, timeout: int = 10):
         try:
             tab_data = self.tab_index.get(tab_id)
@@ -314,5 +305,59 @@ class BrowserManager:
                 "message": f"Element found and clicked on tab_id {tab_id} Port {port}" if click else f"Element found on tab_id {tab_id} Port {port}"
             }
 
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def listen_generator(self, request: Request, tab_id: str, targets: Optional[str] = None):
+        tab_data = self.tab_index.get(tab_id)
+        if not tab_data:
+            yield "data: {\"status\": \"error\", \"message\": \"Tab not found\"}\n\n"
+            return
+
+        tab_obj = tab_data["obj"]
+        stream_id = f"listen_{tab_id}"
+        self.active_elements[stream_id] = True 
+        
+        # Filter traffic for specific targets if provided
+        tab_obj.listen.start(targets=targets) 
+
+        try:
+            while self.active_elements.get(stream_id):
+                if await request.is_disconnected():
+                    break
+
+                # Poll for packets without blocking
+                res_packet = await asyncio.to_thread(tab_obj.listen.wait, timeout=1)
+
+                if res_packet:
+                    # Fetching body is a blocking network call in DrissionPage
+                    body = await asyncio.to_thread(lambda: res_packet.response.body if res_packet.response else None)
+                    
+                    packet_payload = {
+                        "url": res_packet.url,
+                        "method": res_packet.request.method,
+                        "request_headers": dict(res_packet.request.headers),
+                        "response_headers": dict(res_packet.response.headers) if res_packet.response else {},
+                        "status": res_packet.response.status if res_packet.response else "pending",
+                        "cookies": tab_obj.cookies().as_json(), # Returns cookies as JSON
+                        "body": body
+                    }
+                    yield f"data: {json.dumps(packet_payload)}\n\n"
+                
+                await asyncio.sleep(0.05)
+        finally:
+            tab_obj.listen.stop()
+            self.active_elements.pop(stream_id, None)
+
+    async def release_tab_by_id(self, tab_id: str) -> dict:
+        try:
+            if tab_id not in self.tab_index:
+                return {"status": "error", "message": f"Tab {tab_id} not found."}
+            
+            tab_data = self.tab_index[tab_id]
+            await self.tab_pool.put(tab_data)
+            update_registry(tab_data["port"], tab_id, "idle", "about:blank")
+            
+            return {"status": "success", "message": f"Tab {tab_id} released."}
         except Exception as e:
             return {"status": "error", "message": str(e)}

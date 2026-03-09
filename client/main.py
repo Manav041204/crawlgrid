@@ -7,6 +7,8 @@ from typing import Optional
 import psutil
 from DrissionPage import ChromiumPage, ChromiumOptions
 from typing import Optional, List
+from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 # Python file imports
 from manage import BrowserManager
@@ -73,6 +75,21 @@ async def get_element(tab_id: str, xpath: str, click: bool = False, input_text: 
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result)
     return result
+
+@app.get('/listen')
+async def listen_network(request: Request, tab_id: str, targets: Optional[str] = Query(None)):
+    return StreamingResponse(
+        manager.listen_generator(request, tab_id, targets),
+        media_type="text/event-stream"
+    )
+
+@app.get('/stop-listen')
+async def stop_listen(tab_id: str):
+    stream_id = f"listen_{tab_id}"
+    if stream_id in manager.active_elements:
+        manager.active_elements[stream_id] = False
+        return {"status": "success", "message": f"Stop signal sent to listener {tab_id}"}
+    return {"status": "error", "message": "No active listener found for this tab"}
 
 @app.get('/list-browsers')
 async def list_browsers():

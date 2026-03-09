@@ -1,6 +1,7 @@
 import asyncio
 import httpx
 import time
+import json
 
 class CrawlGrid:
     def __init__(self, remote_urls: list[str]):
@@ -82,29 +83,20 @@ class CrawlGrid:
             except Exception as e:
                 print(f"⚠️ Error hitting /launch-tabs: {e}")
 
-    async def get_url(self, url: str):
+    async def get_url(self, url: str, release_tab: bool = False):
         remote_url = self.remote_urls[0] 
         # Increase timeout significantly for 40 concurrent loads
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
                 response = await client.post(
                     f"{remote_url}/get-url", 
-                    params={"url": url, "release_tab": False},
-                    headers={
-                        # 'content-length': '0',
-                        # 'content-type': 'application/json'
-                    }
+                    params={"url": url, "release_tab": release_tab}
                 )
                 if response.status_code == 200:
                     data = response.json()
                     tab_id = data['tab_id']
                     port = data['port']
-                    await self.get_element(tab_id, port, url)
                     print(f"✅ Success: Port {port} | Tab {tab_id} -> {url}")
-                    
-                    # Release tab
-                    await client.post(f"{remote_url}/release-tab", params={"tab_id": tab_id})
-                    
                     return data
                 else:
                     error_detail = response.json().get('detail', response.text)
@@ -114,13 +106,13 @@ class CrawlGrid:
                 print(f"⚠️ Network/Request Error for {url}: {type(e).__name__} - {e}")
                 return None
     
-    async def get_element(self, tab_id, port, url):
+    async def input_element(self, tab_id, port, url, input_text, xpath, timeout=None):
         remote_url = self.remote_urls[0]
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
                     f"{remote_url}/get-element", 
-                    params={"tab_id": tab_id, "input_text": "Tshirt", "xpath": '//input[@id="twotabsearchtextbox"]'}
+                    params={"tab_id": tab_id, "input_text": input_text, "xpath": xpath, "timeout": timeout} if timeout else {"tab_id": tab_id, "input_text": input_text, "xpath": xpath}
                 )
                 if response.status_code == 200:
                     data = response.json()
@@ -131,6 +123,54 @@ class CrawlGrid:
                     print(f"⚠️ Failed to get element on Tab {tab_id}: {response.text}")
             except Exception as e:
                 print(f"⚠️ get_element Error for {url}: {e}")
+            finally:
+                await client.post(f"{remote_url}/release-tab", params={"tab_id": tab_id})
+
+    async def click_element(self, tab_id, port, url, xpath, timeout=None):
+        remote_url = self.remote_urls[0]
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{remote_url}/get-element", 
+                    params={"tab_id": tab_id, "xpath": xpath, "click": True, "timeout": timeout} if timeout else {"tab_id": tab_id, "xpath": xpath, "click": True}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"✅ Success: Port {port} | Tab {tab_id} | clicked -> {url}")
+                else:
+                    print(f"⚠️ Failed to click element on Tab {tab_id}: {response.text}")
+            except Exception as e:
+                print(f"⚠️ click_element Error for {url}: {e}")
+            finally:
+                await client.post(f"{remote_url}/release-tab", params={"tab_id": tab_id})
+
+    async def stream_network(self, tab_id: str, targets: str = None):
+        """Connects to the SSE stream and prints network packets."""
+        remote_url = self.remote_urls[0]
+        url = f"{remote_url}/listen"
+        params = {"tab_id": tab_id, "targets": targets} if targets else {"tab_id": tab_id}
+
+        print(f"📡 [Stream] Connecting to Tab {tab_id}...")
+        
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url, params=params) as response:
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            packet = json.loads(data_str)
+                            print(f"📦 [Packet] {packet['method']} | {packet['url']} | Status: {packet['status']}")
+        except Exception as e:
+            print(f"🛑 [Stream] Connection closed: {e}")
+
+    async def stop_listen(self, tab_id: str):
+        """Calls the /stop-listen endpoint to terminate the stream remotely."""
+        remote_url = self.remote_urls[0]
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{remote_url}/stop-listen", params={"tab_id": tab_id})
+            if response.status_code == 200:
+                print(f"✅ [Control] Listener for {tab_id} stopped.")
+            return response.json()
 
     async def test_get_url(self):
         urls = [
@@ -194,27 +234,110 @@ class CrawlGrid:
         print(f"Total Requests: {len(urls)}")
         print(f"Successful Navigations: {len(successes)}")
         print(f"Capacity Blocked: {len(urls) - len(successes)}")
+
+    async def run_comprehensive_test(self):
+        print("🚀 --- STARTING COMPREHENSIVE GRID TEST ---")
         
+        # 1. CLEANUP & INITIALIZE
+        await self.close_grid()
+        time.sleep(2)
+        
+        # 2. LAUNCH BROWSERS
+        # Launch 2 browser instances
+        await self.launch_grid(instances=2)
+        
+        # 3. SCALE TABS
+        # Scale each browser to have 3 tabs (6 tabs total in the pool)
+        await self.distribute_tabs(tab_per_browser=3)
+        
+        # 4. TARGETED NAVIGATION (HOLDING THE TAB)
+        # We navigate to a site and set release_tab=False so we can use the tab_id for further tasks
+        print("\n📦 Navigating and holding tab for interaction...")
+        nav_result = await self.get_url("https://www.google.com")
+        
+        if nav_result and nav_result.get("status") == "success":
+            t_id = nav_result['tab_id']
+            port = nav_result['port']
+            url = nav_result['url']
+
+            # 5. TEST NETWORK STREAMING
+            # Start the network listener in the background for this specific tab
+            # We filter for 'google' to keep logs clean
+            stream_task = asyncio.create_task(self.stream_network(t_id, targets="google"))
+            
+            # 6. TEST ELEMENT INTERACTION (INPUT)
+            print("\n⌨️ Testing Input...")
+            # Type 'Python' into the Google search bar
+            await self.input_element(
+                tab_id=t_id, 
+                port=port, 
+                url=url, 
+                input_text="Python", 
+                xpath="//textarea[@name='q']" # Standard Google search box xpath
+            )
+            
+            # Give the stream a moment to capture the 'input' network traffic
+            await asyncio.sleep(3)
+
+            # 7. STOP LISTENER
+            print("\n🛑 Stopping Network Stream...")
+            await self.stop_listen(t_id)
+            await stream_task # Ensure the background task wraps up
+
+            # 8. TEST ELEMENT INTERACTION (CLICK)
+            # Note: input_element calls /release-tab in its 'finally' block in your launch.py.
+            # If we want to click now, we need a NEW tab or to have NOT released it yet.
+            # Let's get a fresh tab for a click test
+            print("\n🖱️ Testing Click on fresh tab...")
+            click_nav = await self.get_url("https://books.toscrape.com/")
+            if click_nav:
+                c_tid = click_nav['tab_id']
+                c_port = click_nav['port']
+                # Click the 'Travel' category link
+                await self.click_element(
+                    tab_id=c_tid, 
+                    port=c_port, 
+                    url=click_nav['url'], 
+                    xpath="//a[contains(text(), 'Travel')]"
+                )
+
+        # 9. CONCURRENCY STRESS TEST
+        print("\n🔥 Starting Concurrency Stress Test (10 parallel requests)...")
+        test_urls = ["https://httpbin.org/get" for _ in range(10)]
+        stress_tasks = [self.get_url(u, release_tab=True) for u in test_urls]
+        stress_results = await asyncio.gather(*stress_tasks)
+        
+        success_count = sum(1 for r in stress_results if r and r.get("status") == "success")
+        print(f"\n📊 Stress Test Results: {success_count}/10 successful")
+
+        # 10. FINAL CLEANUP
+        print("\n🧹 Final Cleanup...")
+        await self.close_grid()
+        print("--- TEST COMPLETE ---")
 
 if __name__ == "__main__":
 
     st = time.time()
     crawl_grid = CrawlGrid(["http://localhost:8000"])
 
+    asyncio.run(crawl_grid.run_comprehensive_test())
+
     # 1. Clean up everything first
-    asyncio.run(crawl_grid.close_grid())
+    # asyncio.run(crawl_grid.close_grid())
     
-    time.sleep(5)
+    # time.sleep(5)
     # 2. Start 2 browsers (Default 1 tab each = 2 tabs total)
-    asyncio.run(crawl_grid.launch_grid(instances=2))
+    # asyncio.run(crawl_grid.launch_grid(instances=1))
 
     # 3. Add 4 more tabs (Total 6 tabs)
-    asyncio.run(crawl_grid.distribute_tabs(tab_per_browser=2))
+    # asyncio.run(crawl_grid.distribute_tabs(tab_per_browser=2))
+
+    # asyncio.run(crawl_grid.test_streaming_flow())
     
     # 4. Run 10 URL requests (Should see 6 successes and 4 failures)
-    asyncio.run(crawl_grid.test_get_url())
+    # asyncio.run(crawl_grid.test_get_url())
 
-    asyncio.run(crawl_grid.close_grid())
+    # asyncio.run(crawl_grid.close_grid())
 
-    tt = time.time() - st
-    print(f"Total time: {tt}")
+    # tt = time.time() - st
+    # print(f"Total time: {tt}")
