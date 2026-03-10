@@ -2,342 +2,269 @@ import asyncio
 import httpx
 import time
 import json
+import random
+from contextlib import asynccontextmanager
+from typing import List, Optional, Dict
+
+class BrowserSession:
+    """
+    A stateful session object that represents a locked tab.
+    The user interacts with this object to perform sequential actions.
+    """
+    def __init__(self, grid, remote_url: str, tab_id: str, port: int, initial_url: str):
+        self.grid = grid
+        self.remote_url = remote_url
+        self.tab_id = tab_id
+        self.port = port
+        self.url = initial_url
+        self._listener_task = None
+
+    async def input(self, text: str, xpath: str, timeout: int = 10):
+        """Type text into an element."""
+        return await self.grid.input_element(
+            self.tab_id, self.port, self.url, text, xpath, 
+            timeout=timeout, remote_url=self.remote_url, release=False
+        )
+
+    async def click(self, xpath: str, timeout: int = 10):
+        """Click an element."""
+        return await self.grid.click_element(
+            self.tab_id, self.port, self.url, xpath, 
+            timeout=timeout, remote_url=self.remote_url, release=False
+        )
+
+    async def screenshot(self, filename: str = "capture.png"):
+        """Take a screenshot of the current state."""
+        return await self.grid.capture_screenshot(
+            self.tab_id, filename, remote_url=self.remote_url, release=False
+        )
+
+    async def start_listening(self, targets: str = None):
+        """Starts network interception for this specific session."""
+        self._listener_task = asyncio.create_task(
+            self.grid.stream_network(self.tab_id, targets, remote_url=self.remote_url)
+        )
+        print(f"📡 Listener attached to Session {self.tab_id}")
+
+    async def stop_listening(self):
+        """Stops network interception for this specific session."""
+        await self.grid.stop_listen(self.tab_id, remote_url=self.remote_url)
+        if self._listener_task:
+            self._listener_task.cancel()
 
 class CrawlGrid:
-    def __init__(self, remote_urls: list[str]):
+    def __init__(self, remote_urls: List[str]):
         self.remote_urls = remote_urls
-        self.ports = []
+
+    # --- INFRASTRUCTURE & SCALING ---
 
     async def launch_grid(self, instances: int = 1):
         async with httpx.AsyncClient() as client:
             tasks = []
-
             for remote_url in self.remote_urls:
                 for port in range(9222, 9222 + instances):
-                    tasks.append(
-                        self._launch_instance(client, remote_url, port)
-                    )
-
+                    tasks.append(self._launch_instance(client, remote_url, port))
             await asyncio.gather(*tasks)
 
     async def _launch_instance(self, client, remote_url, port):
         try:
             response = await client.get(f"{remote_url}/launch", params={"port": port})
             if response.status_code == 200:
-                self.ports.append(port)
-                print(f"Browser launched on {remote_url} port {port}")
+                print(f"✅ Browser launched: {remote_url} port {port}")
         except Exception as e:
-            print(f"Failed to launch browser on {remote_url}: {e}")
-
-    async def close_grid(self):
-        async with httpx.AsyncClient() as client:
-            tasks = []
-
-            for remote_url in self.remote_urls:
-                tasks.append(self._close_remote(client, remote_url))
-
-            await asyncio.gather(*tasks)
-
-    async def _close_remote(self, client, remote_url):
-        try:
-            response = await client.get(f"{remote_url}/list-browsers")
-            ports = response.json()
-
-            close_tasks = []
-            for port in ports:
-                close_tasks.append(
-                    self._close_instance(client, remote_url, port)
-                )
-
-            await asyncio.gather(*close_tasks)
-
-        except Exception as e:
-            print(f"Failed to close browser on {remote_url}: {e}")
-
-    async def _close_instance(self, client, remote_url, port):
-        try:
-            response = await client.get(f"{remote_url}/kill", params={"port": port})
-            if response.status_code == 200:
-                print(f"Browser closed on {remote_url} port {port}")
-        except Exception as e:
-            print(f"Failed to close browser on {remote_url} port {port}: {e}")
+            print(f"❌ Launch Failed on {remote_url}: {e}")
 
     async def distribute_tabs(self, total_tabs: int = 0, tab_per_browser: int = 0):
-        """Hits the /distribute-tabs endpoint to scale tab count across browsers."""
-        remote_url = self.remote_urls[0]
         async with httpx.AsyncClient() as client:
-            try:
-                print(f"--- Requesting {total_tabs if total_tabs else tab_per_browser} additional tabs ---")
-                response = await client.get(
-                    f"{remote_url}/launch-tabs", 
-                    params={"total_tabs": total_tabs} if total_tabs > 0 else {"tab_per_browser": tab_per_browser},
-                    timeout=60.0 # Opening many tabs can take time
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    print(f"✅ Distribution Success: {data['message']}")
-                    print(f"📊 Report: {data.get('distribution')}")
-                    return data
-                else:
-                    print(f"❌ Distribution Failed: {response.text}")
-            except Exception as e:
-                print(f"⚠️ Error hitting /launch-tabs: {e}")
+            tasks = []
+            for remote_url in self.remote_urls:
+                params = {"total_tabs": total_tabs} if total_tabs > 0 else {"tab_per_browser": tab_per_browser}
+                tasks.append(client.get(f"{remote_url}/launch-tabs", params=params, timeout=60.0))
+            await asyncio.gather(*tasks)
+            print(f"📊 Tabs distributed across {len(self.remote_urls)} nodes.")
 
-    async def get_url(self, url: str, release_tab: bool = False):
-        remote_url = self.remote_urls[0] 
-        # Increase timeout significantly for 40 concurrent loads
-        async with httpx.AsyncClient(timeout=60.0) as client:
+    # --- LOAD BALANCING & SESSION LOGIC ---
+
+    async def _get_best_node(self) -> str:
+        """Finds the node with the most available (idle) tabs."""
+        best_url = self.remote_urls[0]
+        max_idle = -1
+        # async with httpx.AsyncClient() as client:
+        #     for url in self.remote_urls:
+        #         try:
+        #             resp = await client.get(f"{url}/status", timeout=2.0)
+        #             idle = resp.json().get("idle_tabs", 0)
+        #             if idle > max_idle:
+        #                 max_idle = idle
+        #                 best_url = url
+        #         except: continue
+        return best_url
+
+    @asynccontextmanager
+    async def get_session(self, url: str):
+        """Context manager to handle tab acquisition and automatic release."""
+        remote_url = await self._get_best_node()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{remote_url}/get-url", params={"url": url, "release_tab": False})
+            if resp.status_code != 200:
+                raise Exception(f"Grid Capacity Full on {remote_url} {resp.json()} {resp.status_code}")
+            
+            data = resp.json()
+            session = BrowserSession(self, remote_url, data['tab_id'], data['port'], url)
             try:
-                response = await client.post(
-                    f"{remote_url}/get-url", 
-                    params={"url": url, "release_tab": release_tab}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    tab_id = data['tab_id']
-                    port = data['port']
-                    print(f"✅ Success: Port {port} | Tab {tab_id} -> {url}")
-                    return data
-                else:
-                    error_detail = response.json().get('detail', response.text)
-                    print(f"❌ Server Rejected: {error_detail}")
-                    return None
-            except Exception as e:
-                print(f"⚠️ Network/Request Error for {url}: {type(e).__name__} - {e}")
-                return None
-    
-    async def input_element(self, tab_id, port, url, input_text, xpath, timeout=None):
-        remote_url = self.remote_urls[0]
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{remote_url}/get-element", 
-                    params={"tab_id": tab_id, "input_text": input_text, "xpath": xpath, "timeout": timeout} if timeout else {"tab_id": tab_id, "input_text": input_text, "xpath": xpath}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    element_html = data.get('element_html', '')
-                    html_snippet = element_html[:50] + "..." if element_html else "None"
-                    print(f"✅ Success: Port {port} | Tab {tab_id} | element_html: {html_snippet} -> {url}")
-                else:
-                    print(f"⚠️ Failed to get element on Tab {tab_id}: {response.text}")
-            except Exception as e:
-                print(f"⚠️ get_element Error for {url}: {e}")
+                yield session
             finally:
-                await client.post(f"{remote_url}/release-tab", params={"tab_id": tab_id})
+                # Cleanup: Stop listeners and release tab
+                await session.stop_listening()
+                await client.post(f"{remote_url}/release-tab", params={"tab_id": session.tab_id})
 
-    async def click_element(self, tab_id, port, url, xpath, timeout=None):
-        remote_url = self.remote_urls[0]
+    # --- CORE ACTION COMMANDS ---
+
+    async def input_element(self, tab_id, port, url, input_text, xpath, timeout=10, remote_url=None, release=True):
+        target = remote_url or self.remote_urls[0]
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.post(
-                    f"{remote_url}/get-element", 
-                    params={"tab_id": tab_id, "xpath": xpath, "click": True, "timeout": timeout} if timeout else {"tab_id": tab_id, "xpath": xpath, "click": True}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    print(f"✅ Success: Port {port} | Tab {tab_id} | clicked -> {url}")
-                else:
-                    print(f"⚠️ Failed to click element on Tab {tab_id}: {response.text}")
-            except Exception as e:
-                print(f"⚠️ click_element Error for {url}: {e}")
+                resp = await client.post(f"{target}/get-element", params={
+                    "tab_id": tab_id, "input_text": input_text, "xpath": xpath, "timeout": timeout
+                })
+                return resp.json()
             finally:
-                await client.post(f"{remote_url}/release-tab", params={"tab_id": tab_id})
+                if release: await client.post(f"{target}/release-tab", params={"tab_id": tab_id})
 
-    async def stream_network(self, tab_id: str, targets: str = None):
-        """Connects to the SSE stream and prints network packets."""
-        remote_url = self.remote_urls[0]
-        url = f"{remote_url}/listen"
+    async def click_element(self, tab_id, port, url, xpath, timeout=10, remote_url=None, release=True):
+        target = remote_url or self.remote_urls[0]
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.post(f"{target}/get-element", params={
+                    "tab_id": tab_id, "xpath": xpath, "click": True, "timeout": timeout
+                })
+                return resp.json()
+            finally:
+                if release: await client.post(f"{target}/release-tab", params={"tab_id": tab_id})
+
+    async def capture_screenshot(self, tab_id, filename, remote_url=None, release=False):
+        target = remote_url or self.remote_urls[0]
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{target}/screenshot", params={"tab_id": tab_id, "name": filename})
+                if resp.status_code == 200:
+                    with open(filename, "wb") as f:
+                        f.write(resp.content)
+                    return filename
+            finally:
+                if release: await client.post(f"{target}/release-tab", params={"tab_id": tab_id})
+
+    # --- NETWORK STREAMING COMMANDS ---
+
+    async def stream_network(self, tab_id: str, targets: str = None, remote_url=None):
+        target = remote_url or self.remote_urls[0]
+        url = f"{target}/listen"
         params = {"tab_id": tab_id, "targets": targets} if targets else {"tab_id": tab_id}
-
-        print(f"📡 [Stream] Connecting to Tab {tab_id}...")
         
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("GET", url, params=params) as response:
                     async for line in response.aiter_lines():
                         if line.startswith("data: "):
-                            data_str = line[6:]
-                            packet = json.loads(data_str)
-                            print(f"📦 [Packet] {packet['method']} | {packet['url']} | Status: {packet['status']}")
+                            packet = json.loads(line[6:])
+                            print(f"📦 [Tab {tab_id}] {packet['method']} | {packet['url']} | Status: {packet['status']}")
+        except asyncio.CancelledError:
+            pass 
         except Exception as e:
-            print(f"🛑 [Stream] Connection closed: {e}")
+            print(f"🛑 [Stream Error] {e}")
 
-    async def stop_listen(self, tab_id: str):
-        """Calls the /stop-listen endpoint to terminate the stream remotely."""
-        remote_url = self.remote_urls[0]
+    async def stop_listen(self, tab_id: str, remote_url=None):
+        target = remote_url or self.remote_urls[0]
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{remote_url}/stop-listen", params={"tab_id": tab_id})
-            if response.status_code == 200:
-                print(f"✅ [Control] Listener for {tab_id} stopped.")
-            return response.json()
+            await client.get(f"{target}/stop-listen", params={"tab_id": tab_id})
 
-    async def test_get_url(self):
-        urls = [
-            "https://books.toscrape.com/catalogue/category/books/travel_2/index.html",
-            "https://books.toscrape.com/catalogue/category/books/mystery_3/index.html",
-            "https://books.toscrape.com/catalogue/category/books/historical-fiction_4/index.html",
-            "https://books.toscrape.com/catalogue/category/books/sequential-art_5/index.html",
-            "https://books.toscrape.com/catalogue/category/books/classics_6/index.html",
-            "https://books.toscrape.com/catalogue/category/books/philosophy_7/index.html",
-            "https://books.toscrape.com/catalogue/category/books/romance_8/index.html",
-            "https://books.toscrape.com/catalogue/category/books/womens-fiction_9/index.html",
-            "https://books.toscrape.com/catalogue/category/books/fiction_10/index.html",
-            "https://books.toscrape.com/catalogue/category/books/childrens_11/index.html",
-            "https://books.toscrape.com/catalogue/category/books/religion_12/index.html",
-            "https://books.toscrape.com/catalogue/category/books/nonfiction_13/index.html",
-            "https://books.toscrape.com/catalogue/category/books/music_14/index.html",
-            "https://books.toscrape.com/catalogue/category/books/default_15/index.html",
-            "https://books.toscrape.com/catalogue/category/books/science-fiction_16/index.html",
-            "https://books.toscrape.com/catalogue/category/books/sports-and-games_17/index.html",
-            "https://books.toscrape.com/catalogue/category/books/add-a-comment_18/index.html",
-            "https://books.toscrape.com/catalogue/category/books/fantasy_19/index.html",
-            "https://books.toscrape.com/catalogue/category/books/new-adult_20/index.html",
-            "https://books.toscrape.com/catalogue/category/books/young-adult_21/index.html",
-            "https://books.toscrape.com/catalogue/category/books/science_22/index.html",
-            "https://books.toscrape.com/catalogue/category/books/poetry_23/index.html",
-            "https://books.toscrape.com/catalogue/category/books/paranormal_24/index.html",
-            "https://books.toscrape.com/catalogue/category/books/art_25/index.html",
-            "https://books.toscrape.com/catalogue/category/books/psychology_26/index.html",
-            "https://books.toscrape.com/catalogue/category/books/autobiography_27/index.html",
-            "https://books.toscrape.com/catalogue/category/books/parenting_28/index.html",
-            "https://books.toscrape.com/catalogue/category/books/adult-fiction_29/index.html",
-            "https://books.toscrape.com/catalogue/category/books/humor_30/index.html",
-            "https://books.toscrape.com/catalogue/category/books/horror_31/index.html",
-            "https://books.toscrape.com/catalogue/category/books/history_32/index.html",
-            "https://books.toscrape.com/catalogue/category/books/food-and-drink_33/index.html",
-            "https://books.toscrape.com/catalogue/category/books/christian-fiction_34/index.html",
-            "https://books.toscrape.com/catalogue/category/books/business_35/index.html",
-            "https://books.toscrape.com/catalogue/category/books/biography_36/index.html",
-            "https://books.toscrape.com/catalogue/category/books/thriller_37/index.html",
-            "https://books.toscrape.com/catalogue/category/books/contemporary_38/index.html",
-            "https://books.toscrape.com/catalogue/category/books/spirituality_39/index.html",
-            "https://books.toscrape.com/catalogue/category/books/academic_40/index.html",
-            "https://books.toscrape.com/catalogue/category/books/self-help_41/index.html",
-            "https://books.toscrape.com/catalogue/category/books/historical_42/index.html",
-            "https://books.toscrape.com/catalogue/category/books/christian_43/index.html",
-            "https://books.toscrape.com/catalogue/category/books/suspense_44/index.html",
-            "https://books.toscrape.com/catalogue/category/books/short-stories_45/index.html",
-            "https://books.toscrape.com/catalogue/category/books/novels_46/index.html",
-            "https://books.toscrape.com/catalogue/category/books/health_47/index.html",
-            "https://books.toscrape.com/catalogue/category/books/politics_48/index.html",
-            "https://books.toscrape.com/catalogue/category/books/cultural_49/index.html",
-            "https://books.toscrape.com/catalogue/category/books/erotica_50/index.html",
-            "https://books.toscrape.com/catalogue/category/books/crime_51/index.html",       
-        ]
-        urls = ["https://www.amazon.in/" for _ in range(30)]
-        tasks = [self.get_url(url) for url in urls]
-        results = await asyncio.gather(*tasks)
-
-        successes = [r for r in results if r and r.get("status") == "success"]
-        print(f"\n--- Final Results ---")
-        print(f"Total Requests: {len(urls)}")
-        print(f"Successful Navigations: {len(successes)}")
-        print(f"Capacity Blocked: {len(urls) - len(successes)}")
-
-    async def run_comprehensive_test(self):
-        print("🚀 --- STARTING COMPREHENSIVE GRID TEST ---")
-        
-        # 1. CLEANUP & INITIALIZE
-        await self.close_grid()
-        time.sleep(2)
-        
-        # 2. LAUNCH BROWSERS
-        # Launch 2 browser instances
-        await self.launch_grid(instances=2)
-        
-        # 3. SCALE TABS
-        # Scale each browser to have 3 tabs (6 tabs total in the pool)
-        await self.distribute_tabs(tab_per_browser=3)
-        
-        # 4. TARGETED NAVIGATION (HOLDING THE TAB)
-        # We navigate to a site and set release_tab=False so we can use the tab_id for further tasks
-        print("\n📦 Navigating and holding tab for interaction...")
-        nav_result = await self.get_url("https://www.google.com")
-        
-        if nav_result and nav_result.get("status") == "success":
-            t_id = nav_result['tab_id']
-            port = nav_result['port']
-            url = nav_result['url']
-
-            # 5. TEST NETWORK STREAMING
-            # Start the network listener in the background for this specific tab
-            # We filter for 'google' to keep logs clean
-            stream_task = asyncio.create_task(self.stream_network(t_id, targets="google"))
-            
-            # 6. TEST ELEMENT INTERACTION (INPUT)
-            print("\n⌨️ Testing Input...")
-            # Type 'Python' into the Google search bar
-            await self.input_element(
-                tab_id=t_id, 
-                port=port, 
-                url=url, 
-                input_text="Python", 
-                xpath="//textarea[@name='q']" # Standard Google search box xpath
-            )
-            
-            # Give the stream a moment to capture the 'input' network traffic
-            await asyncio.sleep(3)
-
-            # 7. STOP LISTENER
-            print("\n🛑 Stopping Network Stream...")
-            await self.stop_listen(t_id)
-            await stream_task # Ensure the background task wraps up
-
-            # 8. TEST ELEMENT INTERACTION (CLICK)
-            # Note: input_element calls /release-tab in its 'finally' block in your launch.py.
-            # If we want to click now, we need a NEW tab or to have NOT released it yet.
-            # Let's get a fresh tab for a click test
-            print("\n🖱️ Testing Click on fresh tab...")
-            click_nav = await self.get_url("https://books.toscrape.com/")
-            if click_nav:
-                c_tid = click_nav['tab_id']
-                c_port = click_nav['port']
-                # Click the 'Travel' category link
-                await self.click_element(
-                    tab_id=c_tid, 
-                    port=c_port, 
-                    url=click_nav['url'], 
-                    xpath="//a[contains(text(), 'Travel')]"
-                )
-
-        # 9. CONCURRENCY STRESS TEST
-        print("\n🔥 Starting Concurrency Stress Test (10 parallel requests)...")
-        test_urls = ["https://httpbin.org/get" for _ in range(10)]
-        stress_tasks = [self.get_url(u, release_tab=True) for u in test_urls]
-        stress_results = await asyncio.gather(*stress_tasks)
-        
-        success_count = sum(1 for r in stress_results if r and r.get("status") == "success")
-        print(f"\n📊 Stress Test Results: {success_count}/10 successful")
-
-        # 10. FINAL CLEANUP
-        print("\n🧹 Final Cleanup...")
-        await self.close_grid()
-        print("--- TEST COMPLETE ---")
+    async def close_grid(self):
+        async with httpx.AsyncClient() as client:
+            for remote_url in self.remote_urls:
+                try:
+                    resp = await client.get(f"{remote_url}/list-browsers")
+                    for port in resp.json():
+                        await client.get(f"{remote_url}/kill", params={"port": port})
+                except: pass
 
 if __name__ == "__main__":
+    async def browse_task(grid: CrawlGrid, task_id: int, search_term: str):
+        """A single worker task that uses a session."""
+        print(f"🚀 Task {task_id}: Starting search for '{search_term}'")
+        
+        try:
+            async with grid.get_session("https://www.google.com") as session:
+                await session.start_listening(targets="google")
+                
+                await session.input(search_term, "//textarea[@name='q']")
+                await session.click("//input[@name='btnK']")
+                
+                await asyncio.sleep(random.uniform(2, 4))
+                
+                filename = f"result_task_{task_id}.png"
+                await session.screenshot(filename)
+                print(f"✅ Task {task_id}: Finished. Screenshot saved as {filename}")
+                
+        except Exception as e:
+            print(f"❌ Task {task_id} failed: {e}")
 
-    st = time.time()
-    crawl_grid = CrawlGrid(["http://localhost:8000"])
+    async def run_stress_test():
+        grid = CrawlGrid(["http://localhost:8000"])
+        
+        print("🛠️  Step 1: Launching 3 browser instances...")
+        await grid.launch_grid(instances=3) 
+        
+        print("🛠️  Step 2: Distributing 4 tabs per browser (12 tabs total)...")
+        await grid.distribute_tabs(total_tabs=12)
 
-    asyncio.run(crawl_grid.run_comprehensive_test())
+        queries = ["Python", "FastAPI", "Asyncio", "Httpx", "DrissionPage", 
+                "Web Scraping", "Load Balancing", "Concurrency", "Docker", "Linux"]
 
-    # 1. Clean up everything first
-    # asyncio.run(crawl_grid.close_grid())
+        print(f"🔥 Step 3: Running {len(queries)} parallel sessions...")
+        start_time = time.time()
+        
+        tasks = [browse_task(grid, i, queries[i]) for i in range(len(queries))]
+        await asyncio.gather(*tasks)
+
+        duration = time.time() - start_time
+        print(f"\n✨ All tasks complete in {duration:.2f} seconds.")
+
+    async def single_run_test():
+    # 1. Initialize Grid (pointing to your local API)
+        grid = CrawlGrid(["http://localhost:8000"])
+        
+        print("🛠️  Step 1: Launching 1 browser instance...")
+        await grid.launch_grid(instances=1)
+        
+        print("🛠️  Step 2: Distributing 1 tab...")
+        await grid.distribute_tabs(tab_per_browser=2)
+
+        print("🚀 Step 3: Starting Single Session...")
+        try:
+            async with grid.get_session("https://www.google.com") as session:
+                # A. Start Network Listener
+                print("📡 Attaching listener...")
+                await session.start_listening(targets="google")
+                
+                # B. Perform a simple search
+                print("⌨️  Typing search query...")
+                await session.input("FastAPI StreamingResponse", "//textarea[@name='q']")
+                
+                print("🖱️  Clicking search button...")
+                await session.click("//input[@name='btnK']")
+                
+                # C. Wait for some packets to flow
+                print("⏳ Waiting for network traffic...")
+                await asyncio.sleep(5)
+                
+                # D. Capture final state
+                print("📸 Taking screenshot...")
+                await session.screenshot("single_test_result.png")
+                
+                print("✅ Actions completed. Exiting context manager (this triggers release).")
+
+        except Exception as e:
+            print(f"❌ Test Failed: {e}")
     
-    # time.sleep(5)
-    # 2. Start 2 browsers (Default 1 tab each = 2 tabs total)
-    # asyncio.run(crawl_grid.launch_grid(instances=1))
-
-    # 3. Add 4 more tabs (Total 6 tabs)
-    # asyncio.run(crawl_grid.distribute_tabs(tab_per_browser=2))
-
-    # asyncio.run(crawl_grid.test_streaming_flow())
-    
-    # 4. Run 10 URL requests (Should see 6 successes and 4 failures)
-    # asyncio.run(crawl_grid.test_get_url())
-
-    # asyncio.run(crawl_grid.close_grid())
-
-    # tt = time.time() - st
-    # print(f"Total time: {tt}")
+    asyncio.run(run_stress_test())
+    # asyncio.run(single_run_test())

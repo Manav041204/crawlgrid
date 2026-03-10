@@ -171,6 +171,71 @@ class BrowserManager:
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
+    # async def launch_tabs(self, total_tabs: Optional[int] = None, tab_per_browser: Optional[int] = None) -> dict:
+    #     try:
+    #         registry = load_registry()
+    #         active_ports = list(registry.keys())
+    #         if not active_ports:
+    #             return {"status": "error", "message": "No active browsers found."}
+
+    #         report = {}
+            
+    #         for port_str in active_ports:
+    #             page = self.get_browser(int(port_str))
+                
+    #             # 1. ACTUAL PHYSICAL CHECK: Talk to the browser process
+    #             # We use .tab_ids because it is the source of truth
+    #             actual_tab_ids = await asyncio.to_thread(lambda: page.tab_ids)
+                
+    #             # 2. RECONCILE MEMORY: Add any "unknown" physical tabs to our index
+    #             for tid in actual_tab_ids:
+    #                 if tid not in self.tab_index:
+    #                     tab_obj = await asyncio.to_thread(page.get_tab, tid)
+    #                     self.tab_index[tid] = {"port": port_str, "obj": tab_obj, "tab_id": tid}
+    #                     await self.tab_pool.put(self.tab_index[tid])
+
+    #             # 3. CALCULATE BASED ON TRUTH: 
+    #             # Use actual_tab_ids count, not what the registry JSON said
+    #             current_physical_count = len(actual_tab_ids)
+    #             target = tab_per_browser if tab_per_browser else current_physical_count
+    #             needed = max(0, target - current_physical_count)
+                
+    #             # 4. CREATE ONLY WHAT IS MISSING
+    #             new_tab_data = {}
+    #             for _ in range(needed):
+    #                 new_tab = await asyncio.to_thread(page.new_tab)
+    #                 tid = new_tab.tab_id
+                    
+    #                 # Store in memory
+    #                 tab_info = {"port": port_str, "obj": new_tab, "tab_id": tid}
+    #                 self.tab_index[tid] = tab_info
+    #                 await self.tab_pool.put(tab_info)
+                    
+    #                 # Track for registry update
+    #                 new_tab_data[tid] = {"status": "idle", "url": "about:blank"}
+    #                 report[port_str] = report.get(port_str, 0) + 1
+
+    #             # 5. SYNC REGISTRY: Overwrite registry with actual physical state
+    #             # This wipes out any "ghost" tabs that were in the JSON but not in the browser
+    #             current_tabs_registry = {}
+    #             # Re-fetch physical IDs to be 100% sure
+    #             final_ids = await asyncio.to_thread(lambda: page.tab_ids)
+    #             for tid in final_ids:
+    #                 current_tabs_registry[tid] = {"status": "idle", "url": "about:blank"}
+                
+    #             registry[port_str]["tabs"] = current_tabs_registry
+
+    #         save_registry(registry)
+            
+    #         return {
+    #             "status": "success", 
+    #             "added": report,
+    #             "total_pool": self.tab_pool.qsize()
+    #         }
+
+    #     except Exception as e:
+    #         return {"status": "error", "message": f"Sync failed: {str(e)}"}
+
     async def get_url(self, url: str, release_tab: bool = True) -> dict:
         """Uses the in-memory tab pool for near-instant URL processing."""
         tab_data = None
@@ -185,7 +250,6 @@ class BrowserManager:
                     self.tab_pool.task_done()
                     tab_data = None
                     continue
-                
                 break
 
             tab_obj = tab_data["obj"]
@@ -326,12 +390,25 @@ class BrowserManager:
                 if await request.is_disconnected():
                     break
 
-                # Poll for packets without blocking
+                # Poll for packets without blocking the main loop
                 res_packet = await asyncio.to_thread(tab_obj.listen.wait, timeout=1)
 
                 if res_packet:
                     # Fetching body is a blocking network call in DrissionPage
-                    body = await asyncio.to_thread(lambda: res_packet.response.body if res_packet.response else None)
+                    raw_body = await asyncio.to_thread(lambda: res_packet.response.body if res_packet.response else None)
+                    
+                    # --- SAFE ENCODING BLOCK ---
+                    # Convert bytes to a JSON-serializable format
+                    body_str = None
+                    if isinstance(raw_body, bytes):
+                        try:
+                            # Try decoding as text
+                            body_str = raw_body.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # If binary (images/compressed), use a placeholder or base64
+                            body_str = f"<Binary Data: {len(raw_body)} bytes>"
+                    elif raw_body is not None:
+                        body_str = str(raw_body)
                     
                     packet_payload = {
                         "url": res_packet.url,
@@ -339,15 +416,45 @@ class BrowserManager:
                         "request_headers": dict(res_packet.request.headers),
                         "response_headers": dict(res_packet.response.headers) if res_packet.response else {},
                         "status": res_packet.response.status if res_packet.response else "pending",
-                        "cookies": tab_obj.cookies().as_json(), # Returns cookies as JSON
-                        "body": body
+                        "cookies": tab_obj.cookies().as_json(),
+                        "body": body_str  # Now guaranteed to be a string or None
                     }
-                    yield f"data: {json.dumps(packet_payload)}\n\n"
+
+                    try:
+                        # Ensure the dump itself doesn't crash the generator
+                        yield f"data: {json.dumps(packet_payload)}\n\n"
+                    except (TypeError, ValueError) as e:
+                        yield f"data: {json.dumps({'error': 'serialization_failed', 'details': str(e)})}\n\n"
                 
+                # Small sleep to yield control back to the event loop
                 await asyncio.sleep(0.05)
+
+        except Exception as e:
+            # Catch unexpected errors to prevent the ASGI worker from crashing
+            yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
         finally:
-            tab_obj.listen.stop()
+            # Ensure cleanup happens even if the client disconnects or an error occurs
+            await asyncio.to_thread(tab_obj.listen.stop)
             self.active_elements.pop(stream_id, None)
+            # Optional: Signal the client that the stream is closing gracefully
+            # yield "data: [DONE]\n\n"
+
+    async def take_screenshot(self, tab_id: str, name: str = "screenshot.png") -> Optional[str]:
+        try:
+            tab_data = self.tab_index.get(tab_id)
+            if not tab_data:
+                return None
+            
+            tab_obj = tab_data["obj"]
+            
+            # Execute the screenshot in a thread to keep the event loop free
+            file_path = await asyncio.to_thread(
+                lambda: tab_obj.get_screenshot(path=name, full_page=True)
+            )
+            return file_path
+        except Exception as e:
+            print(f"Screenshot Error: {e}")
+            return None
 
     async def release_tab_by_id(self, tab_id: str) -> dict:
         try:

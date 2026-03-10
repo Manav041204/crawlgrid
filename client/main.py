@@ -8,8 +8,7 @@ import psutil
 from DrissionPage import ChromiumPage, ChromiumOptions
 from typing import Optional, List
 from fastapi import Request
-from fastapi.responses import StreamingResponse
-
+from fastapi.responses import StreamingResponse, FileResponse
 # Python file imports
 from manage import BrowserManager
 from utils import get_active_ports, load_registry, cleanup_all_resources
@@ -90,6 +89,13 @@ async def stop_listen(tab_id: str):
         manager.active_elements[stream_id] = False
         return {"status": "success", "message": f"Stop signal sent to listener {tab_id}"}
     return {"status": "error", "message": "No active listener found for this tab"}
+
+@app.get('/screenshot')
+async def get_screenshot(tab_id: str = Query(...), name: Optional[str] = "screenshot.png"):
+    file_path = await manager.take_screenshot(tab_id, name)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Screenshot failed or tab not found")
+    return FileResponse(file_path, media_type="image/png", filename=name)
 
 @app.get('/list-browsers')
 async def list_browsers():
